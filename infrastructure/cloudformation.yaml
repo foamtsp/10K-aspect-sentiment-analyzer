@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  10-K sentiment pipeline (MVP). A single scorer Lambda behind an HTTP API
+  Gateway reads from EDGAR, runs FinBERT locally (bundled in the Lambda
+  image), runs the inline XGBoost classifier, and caches results in the
+  existing churn-db MySQL RDS instance. A separate Streamlit container on
+  ECS Fargate is the UI.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: tenk
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the ECS dashboard service.
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the public Streamlit ECS service.
+  ScorerImageUri:
+    Type: String
+    Description: ECR URI for the scorer Lambda container image (including tag).
+  DashboardImageUri:
+    Type: String
+    Description: ECR URI for the Streamlit dashboard container image.
+  DBHost:
+    Type: String
+  DBPort:
+    Type: String
+    Default: "3306"
+  DBName:
+    Type: String
+    Default: tenk
+  DBUsername:
+    Type: String
+    NoEcho: true
+  DBPassword:
+    Type: String
+    NoEcho: true
+  LabRoleArn:
+    Type: String
+    Description: >-
+      Pre-existing IAM role used by all services in this stack (Lambda + ECS
+      task + ECS task-execution). In AWS Academy / Learner Lab this is
+      typically arn:aws:iam::<acct>:role/LabRole.
+
+Resources:
+
+  # --- Security groups ---------------------------------------------------
+
+  DashboardSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public access to Streamlit on 8501.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # --- Secrets -----------------------------------------------------------
+
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/db"
+      SecretString: !Sub |
+        {
+          "host": "${DBHost}",
+          "port": ${DBPort},
+          "username": "${DBUsername}",
+          "password": "${DBPassword}",
+          "dbname": "${DBName}"
+        }
+
+  # No IAM role resources: Lambda and ECS reuse the pre-existing LabRoleArn
+  # parameter (AWS Academy / Learner Lab constraint).
+
+  # --- Scorer Lambda -----------------------------------------------------
+
+  ScorerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-scorer"
+      RetentionInDays: 14
+
+  ScorerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ScorerLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-scorer"
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ScorerImageUri
+      Role: !Ref LabRoleArn
+      Timeout: 60
+      # 8 GB gives ~4 vCPUs; FinBERT CPU inference on ~500 sentences takes ~8-12 s.
+      MemorySize: 8192
+      # No VpcConfig: Lambda runs outside the VPC so it can reach EDGAR on the
+      # internet. RDS must allow inbound TCP 3306 from 0.0.0.0/0 (or Lambda's
+      # IP range) — acceptable for a demo on a non-public-facing RDS endpoint.
+      Environment:
+        Variables:
+          DB_SECRET_ARN: !Ref DBSecret
+          MODEL_VERSION: v1
+          HORIZON_DAYS: "30"
+          HF_HOME: /opt/finbert/hf
+          TORCH_NUM_THREADS: "4"
+
+  # --- HTTP API Gateway --------------------------------------------------
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET", "POST", "OPTIONS"]
+        AllowHeaders: ["content-type"]
+
+  ScorerIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ScorerFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  FilingsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /tickers/{ticker}/filings'
+      Target: !Sub "integrations/${ScorerIntegration}"
+
+  AnalysisRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /tickers/{ticker}/analysis'
+      Target: !Sub "integrations/${ScorerIntegration}"
+
+  AnalysisTriggerRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /tickers/{ticker}/analysis'
+      Target: !Sub "integrations/${ScorerIntegration}"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScorerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  # --- Streamlit dashboard on ECS Fargate --------------------------------
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+
+  DashboardLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-dashboard"
+      RetentionInDays: 14
+
+  DashboardTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-dashboard"
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !Ref LabRoleArn
+      TaskRoleArn: !Ref LabRoleArn
+      ContainerDefinitions:
+        - Name: dashboard
+          Image: !Ref DashboardImageUri
+          PortMappings:
+            - ContainerPort: 8501
+          Environment:
+            - Name: API_BASE_URL
+              Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DashboardLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: dashboard
+
+  DashboardService:
+    Type: AWS::ECS::Service
+    DependsOn: ApiStage
+    Properties:
+      ServiceName: !Sub "${ProjectName}-dashboard"
+      Cluster: !Ref EcsCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !Ref DashboardTaskDef
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups:
+            - !Ref DashboardSecurityGroup
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL of the HTTP API (wire into the dashboard's API_BASE_URL).
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  DashboardSecurityGroupId:
+    Value: !Ref DashboardSecurityGroup
+  ClusterName:
+    Value: !Ref EcsCluster
+  DashboardServiceName:
+    Value: !GetAtt DashboardService.Name

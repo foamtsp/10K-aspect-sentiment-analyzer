@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Large data — store separately (S3, DVC, etc.)
+Dataset/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Docker build cache
+.dockerignore
